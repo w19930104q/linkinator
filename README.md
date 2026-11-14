@@ -483,6 +483,8 @@ Constructor method that can be used to create a new `LinkChecker` instance.  Thi
   - `displayText` (string, optional) - The normalized text content of the source `<a>` element. This is omitted for the initial URL and links discovered outside anchor elements.
   - `state` (string) - The result of the scan.  Potential values include `BROKEN`, `OK`, or `SKIPPED`.
   - `status` (number) - The HTTP status code of the request.
+  - `finalUrl` (string, optional) - The final url reached after following redirects, when it differs from `url`. Multiple entry points that redirect to the same page share a single fetch of that page, and each result traces back to this final url.
+  - `source` (string, optional) - The entry point (seed) url whose crawl discovered this link. Useful when scanning multiple locations at once.
 
 ### Examples
 

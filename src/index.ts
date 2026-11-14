@@ -71,6 +71,17 @@ export type LinkResult = {
 	state: LinkState;
 	parent?: string;
 	failureDetails?: Array<Error | HttpResponse>;
+	/**
+	 * The final URL reached after following redirects, when it differs from
+	 * `url`. Lets callers trace which page a redirected entry actually landed
+	 * on, and which page was fetched on its behalf.
+	 */
+	finalUrl?: string;
+	/**
+	 * The entry point (seed) URL whose crawl discovered this link. Every row
+	 * produced by a multi-entry scan carries the entry it traces back to.
+	 */
+	source?: string;
 };
 
 export type CrawlResult = {
@@ -102,6 +113,43 @@ type CrawlOptions = {
 	retryErrorsJitter: number;
 	requestLimiter: RequestLimiter;
 	signal: AbortSignal;
+	/** Identity of this enqueued crawl, stable across retries. */
+	crawlId: symbol;
+	/** Entry point (seed) URL whose crawl tree produced this crawl. */
+	entryPoint: string;
+	/** Shared ledger of final-page fetches, keyed by normalized URL. */
+	fetchLedger: Map<string, FetchLedgerEntry>;
+	/** Tracks which crawl each crawl is waiting on, for cycle detection. */
+	waitGraph: Map<symbol, symbol>;
+	/** This crawl's own ledger entry, created on first execution. */
+	ledgerEntry?: FetchLedgerEntry;
+};
+
+/**
+ * The recorded outcome of fetching a final page. Entries that arrive at the
+ * same page through another entry point or a redirect reuse this instead of
+ * issuing a duplicate request.
+ */
+type FetchOutcome = {
+	/** Final URL after redirects (the requested URL when none occurred). */
+	finalUrl: string;
+	status?: number;
+	/** Link state before per-entry policies such as requireHttps. */
+	state: LinkState;
+	failureDetails: Array<Error | HttpResponse>;
+	isHtml: boolean;
+	/** True when the final response itself was a (non-standard) redirect. */
+	finalStatusIsRedirect: boolean;
+	finalRedirectNonStandard: boolean;
+	fragmentPage?: FragmentPage;
+};
+
+type FetchLedgerEntry = {
+	owner: symbol;
+	/** Whether the owning crawl fetches GET bodies and recurses. */
+	crawl: boolean;
+	promise: Promise<FetchOutcome>;
+	resolve: (outcome: FetchOutcome) => void;
 };
 
 type CrawlTarget = {
@@ -239,9 +287,55 @@ async function waitForRetry(milliseconds: number, signal: AbortSignal) {
 	});
 }
 
+const UNRESERVED_URL_CHARACTER = /^[A-Za-z0-9\-._~]$/;
+
+/**
+ * Produce the ledger key for a URL: fragmentless, with RFC 3986
+ * normalization of percent-encoded path characters so that spellings like
+ * `/~docs` and `/%7Edocs` share a single fetch.
+ */
+function normalizeUrlKey(href: string): string {
+	try {
+		const url = new URL(href);
+		url.hash = '';
+		url.pathname = url.pathname.replace(
+			/%([0-9a-fA-F]{2})/g,
+			(_sequence, hex: string) => {
+				const character = String.fromCharCode(Number.parseInt(hex, 16));
+				return UNRESERVED_URL_CHARACTER.test(character)
+					? character
+					: `%${hex.toUpperCase()}`;
+			},
+		);
+		return url.href;
+	} catch {
+		return href;
+	}
+}
+
+function createLedgerEntry(owner: symbol, crawl: boolean): FetchLedgerEntry {
+	let resolve: (outcome: FetchOutcome) => void = () => {};
+	const promise = new Promise<FetchOutcome>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { owner, crawl, promise, resolve };
+}
+
+function waitForAbort(signal: AbortSignal): Promise<undefined> {
+	if (signal.aborted) {
+		return Promise.resolve(undefined);
+	}
+	return new Promise((resolve) => {
+		signal.addEventListener('abort', () => resolve(undefined), {
+			once: true,
+		});
+	});
+}
+
 type FragmentReference = {
 	displayText?: string;
 	parent: string;
+	source: string;
 };
 
 type FragmentPage = {
@@ -394,6 +488,8 @@ export class LinkChecker extends EventEmitter {
 		const pendingChecks = new Map<string, Promise<void>>();
 		const delayCache = new Map<string, number>();
 		const retryErrorsCache = new Map<string, number>();
+		const fetchLedger = new Map<string, FetchLedgerEntry>();
+		const waitGraph = new Map<symbol, symbol>();
 
 		const enqueueTarget = (target: CrawlTarget) => {
 			const url = new URL(target.url);
@@ -424,6 +520,10 @@ export class LinkChecker extends EventEmitter {
 				retryErrorsJitter,
 				requestLimiter,
 				signal: runController.signal,
+				crawlId: Symbol(),
+				entryPoint: url.href,
+				fetchLedger,
+				waitGraph,
 			});
 		};
 		if (options.sitemap) {
@@ -755,458 +855,555 @@ export class LinkChecker extends EventEmitter {
 			}
 		}
 
-		// Perform a HEAD or GET request based on the need to crawl
-		let status = 0;
-		let state = LinkState.BROKEN;
-		let shouldRecurse = false;
-		let response: RequestResponse | undefined;
-		const failures: Array<Error | HttpResponse> = [];
-		const originalUrl = options.url.href;
-		const redirectMode =
-			options.checkOptions.redirects === 'error' ? 'manual' : 'follow';
-		const processRedirectTarget =
-			redirectMode === 'follow' &&
-			(this.hasSkipRules(options.checkOptions) ||
-				Boolean(options.checkOptions.urlRewriteExpressions?.length))
-				? (url: string) => this.processRedirectTarget(url, options.checkOptions)
-				: undefined;
-		const requestOptions = {
-			headers: options.checkOptions.headers,
-			timeout: options.checkOptions.timeout,
-			redirect: redirectMode,
-			allowInsecureCerts: options.checkOptions.allowInsecureCerts,
-			processRedirectTarget,
-			signal: options.signal,
-		} as const;
-
-		try {
-			response = await makeRequest(
-				options.crawl ? 'GET' : 'HEAD',
-				options.url.href,
-				requestOptions,
-			);
-			if (response.redirectSkipped) {
-				this.recordSkippedResult(options);
+		// Check in with the shared fetch ledger. Multiple entry points and
+		// recursively discovered links that resolve to the same final page share
+		// a single fetch; later crawls reuse the recorded outcome instead of
+		// issuing a duplicate request.
+		const ledgerKey = normalizeUrlKey(options.url.href);
+		const existingEntry = options.fetchLedger.get(ledgerKey);
+		if (existingEntry && existingEntry.owner !== options.crawlId) {
+			const reusedOutcome = await this.reuseLedgerEntry(existingEntry, options);
+			if (reusedOutcome) {
+				// A retry may find its own entry replaced by another crawl's;
+				// settle it so crawls waiting on it are not left pending.
+				options.ledgerEntry?.resolve(reusedOutcome);
 				return;
 			}
-			if (this.shouldRetryAfter(response, options)) {
-				return;
-			}
-
-			// If we got an HTTP 405, the server may not like HEAD. GET instead!
-			if (response.status === 405) {
-				response = await makeRequest('GET', options.url.href, requestOptions);
-				if (response.redirectSkipped) {
-					this.recordSkippedResult(options);
-					return;
-				}
-				if (this.shouldRetryAfter(response, options)) {
-					return;
-				}
-			}
-		} catch (error) {
-			// Request failure: invalid domain name, etc.
-			// this also occasionally catches too many redirects, but is still valid (e.g. https://www.ebay.com)
-			// for this reason, we also try doing a GET below to see if the link is valid
-			failures.push(error as Error);
 		}
-
-		try {
-			// Some sites don't respond well to HEAD requests, even if they don't return a 405.
-			// This is a last gasp effort to see if the link is valid.
-			if (
-				(response === undefined ||
-					response.status < 200 ||
-					response.status >= 300) &&
-				!options.crawl
-			) {
-				response = await makeRequest('GET', options.url.href, requestOptions);
-				if (response.redirectSkipped) {
-					this.recordSkippedResult(options);
-					return;
-				}
-				if (this.shouldRetryAfter(response, options)) {
-					return;
-				}
-			}
-		} catch (error) {
-			failures.push(error as Error);
-			// Catch the next failure
+		if (!options.ledgerEntry) {
+			options.ledgerEntry = createLedgerEntry(options.crawlId, options.crawl);
 		}
-
-		if (response !== undefined) {
-			status = response.status;
-			shouldRecurse =
-				isHtml(response) ||
-				(isCss(response) && options.checkOptions.checkCss === true);
-		}
-
-		// If we want to recurse into a CSS file and we used HEAD, we need to do a GET
-		// to get the body for parsing URLs (only if checkCss is enabled)
+		const ledgerEntry = options.ledgerEntry;
+		const currentEntry = options.fetchLedger.get(ledgerKey);
 		if (
-			shouldRecurse &&
-			response !== undefined &&
-			isCss(response) &&
-			!response.body &&
-			options.crawl &&
-			options.checkOptions.checkCss
+			!currentEntry ||
+			currentEntry.owner === options.crawlId ||
+			(options.crawl && !currentEntry.crawl)
 		) {
+			options.fetchLedger.set(ledgerKey, ledgerEntry);
+		}
+
+		// The outcome shared with other crawls through the ledger. Resolved when
+		// this crawl reaches a terminal state; retries keep it pending.
+		let ledgerOutcome: FetchOutcome | undefined;
+		let ledgerKeepPending = false;
+		const recordSkipped = () => {
+			ledgerOutcome = {
+				finalUrl: options.url.href,
+				status: undefined,
+				state: LinkState.SKIPPED,
+				failureDetails: [],
+				isHtml: false,
+				finalStatusIsRedirect: false,
+				finalRedirectNonStandard: false,
+			};
+			this.recordSkippedResult(options);
+		};
+		try {
+			// Perform a HEAD or GET request based on the need to crawl
+			let status = 0;
+			let state = LinkState.BROKEN;
+			let shouldRecurse = false;
+			let response: RequestResponse | undefined;
+			const failures: Array<Error | HttpResponse> = [];
+			const originalUrl = options.url.href;
+			const redirectMode =
+				options.checkOptions.redirects === 'error' ? 'manual' : 'follow';
+			const processRedirectTarget =
+				redirectMode === 'follow'
+					? (url: string) => this.processCrawlRedirectTarget(url, options)
+					: undefined;
+			const requestOptions = {
+				headers: options.checkOptions.headers,
+				timeout: options.checkOptions.timeout,
+				redirect: redirectMode,
+				allowInsecureCerts: options.checkOptions.allowInsecureCerts,
+				processRedirectTarget,
+				signal: options.signal,
+			} as const;
+			// Fallback requests within this crawl (HEAD→GET retries) keep the
+			// skip/rewrite behavior but never stop at ledger entries: this crawl is
+			// already committed to its own request chain.
+			const fallbackProcessRedirectTarget =
+				redirectMode === 'follow' &&
+				(this.hasSkipRules(options.checkOptions) ||
+					Boolean(options.checkOptions.urlRewriteExpressions?.length))
+					? (url: string) =>
+							this.processRedirectTarget(url, options.checkOptions)
+					: undefined;
+			const fallbackRequestOptions = {
+				...requestOptions,
+				processRedirectTarget: fallbackProcessRedirectTarget,
+			};
+
 			try {
-				response = await makeRequest('GET', options.url.href, requestOptions);
-				if (response.redirectSkipped) {
-					this.recordSkippedResult(options);
+				response = await makeRequest(
+					options.crawl ? 'GET' : 'HEAD',
+					options.url.href,
+					requestOptions,
+				);
+				const ledgerResult = await this.followLedgerHits(
+					options.crawl ? 'GET' : 'HEAD',
+					response,
+					options,
+					requestOptions,
+					fallbackRequestOptions,
+				);
+				if (ledgerResult.reused) {
+					ledgerOutcome = ledgerResult.reused;
 					return;
 				}
-				if (response !== undefined) {
-					status = response.status;
+				response = ledgerResult.response;
+				if (response.redirectSkipped) {
+					recordSkipped();
+					return;
+				}
+				if (this.shouldRetryAfter(response, options)) {
+					ledgerKeepPending = true;
+					return;
+				}
+
+				// If we got an HTTP 405, the server may not like HEAD. GET instead!
+				if (response.status === 405) {
+					response = await makeRequest(
+						'GET',
+						options.url.href,
+						fallbackRequestOptions,
+					);
+					if (response.redirectSkipped) {
+						recordSkipped();
+						return;
+					}
+					if (this.shouldRetryAfter(response, options)) {
+						ledgerKeepPending = true;
+						return;
+					}
+				}
+			} catch (error) {
+				// Request failure: invalid domain name, etc.
+				// this also occasionally catches too many redirects, but is still valid (e.g. https://www.ebay.com)
+				// for this reason, we also try doing a GET below to see if the link is valid
+				failures.push(error as Error);
+			}
+
+			try {
+				// Some sites don't respond well to HEAD requests, even if they don't return a 405.
+				// This is a last gasp effort to see if the link is valid.
+				if (
+					(response === undefined ||
+						response.status < 200 ||
+						response.status >= 300) &&
+					!options.crawl
+				) {
+					response = await makeRequest(
+						'GET',
+						options.url.href,
+						fallbackRequestOptions,
+					);
+					if (response.redirectSkipped) {
+						recordSkipped();
+						return;
+					}
+					if (this.shouldRetryAfter(response, options)) {
+						ledgerKeepPending = true;
+						return;
+					}
 				}
 			} catch (error) {
 				failures.push(error as Error);
+				// Catch the next failure
 			}
-		}
 
-		// If retryErrors is enabled, retry 5xx and 0 status (which indicates
-		// a network error likely occurred) or 429 without retry-after data:
-		if (options.signal.aborted) {
-			return;
-		}
-		if (this.shouldRetryOnError(status, options)) {
-			return;
-		}
-
-		// Detect if this was a redirect
-		const redirect = detectRedirect(status, originalUrl, response);
-
-		// Check for custom status code actions first (highest priority)
-		const customAction = getStatusCodeAction(
-			status,
-			options.checkOptions.statusCodes,
-		);
-
-		if (customAction === 'ok') {
-			// Treat as success
-			state = LinkState.OK;
-		} else if (customAction === 'warn') {
-			// Treat as success but emit warning
-			state = LinkState.OK;
-			this.emit('statusCodeWarning', {
-				url: originalUrl,
-				status,
-			});
-		} else if (customAction === 'skip') {
-			// Skip this link entirely
-			state = LinkState.SKIPPED;
-		} else if (customAction === 'error') {
-			// Force failure
-			state = LinkState.BROKEN;
 			if (response !== undefined) {
-				failures.push(response);
+				status = response.status;
+				shouldRecurse =
+					isHtml(response) ||
+					(isCss(response) && options.checkOptions.checkCss === true);
 			}
-		}
-		// Special handling for bot protection responses
-		// Status 999: Used by LinkedIn and other sites to block automated requests
-		// Status 403 with cf-mitigated: Cloudflare bot protection challenge
-		// Since we cannot distinguish between valid and invalid URLs when blocked,
-		// treat these as skipped rather than broken.
-		else if (status === 999) {
-			state = LinkState.SKIPPED;
-		} else if (
-			status === 403 &&
-			response !== undefined &&
-			response.headers['cf-mitigated']
-		) {
-			state = LinkState.SKIPPED;
-		}
-		// Handle 'error' mode - treat any redirect as broken
-		else if (
-			options.checkOptions.redirects === 'error' &&
-			redirect.isRedirect
-		) {
-			state = LinkState.BROKEN;
-			const targetInfo = redirect.targetUrl ? ` to ${redirect.targetUrl}` : '';
-			failures.push({
+
+			// If we want to recurse into a CSS file and we used HEAD, we need to do a GET
+			// to get the body for parsing URLs (only if checkCss is enabled)
+			if (
+				shouldRecurse &&
+				response !== undefined &&
+				isCss(response) &&
+				!response.body &&
+				options.crawl &&
+				options.checkOptions.checkCss
+			) {
+				try {
+					response = await makeRequest(
+						'GET',
+						options.url.href,
+						fallbackRequestOptions,
+					);
+					if (response.redirectSkipped) {
+						recordSkipped();
+						return;
+					}
+					if (response !== undefined) {
+						status = response.status;
+					}
+				} catch (error) {
+					failures.push(error as Error);
+				}
+			}
+
+			// If retryErrors is enabled, retry 5xx and 0 status (which indicates
+			// a network error likely occurred) or 429 without retry-after data:
+			if (options.signal.aborted) {
+				return;
+			}
+			if (this.shouldRetryOnError(status, options)) {
+				ledgerKeepPending = true;
+				return;
+			}
+
+			// Detect if this was a redirect
+			const redirect = detectRedirect(status, originalUrl, response);
+
+			// Check for custom status code actions first (highest priority)
+			const customAction = getStatusCodeAction(
 				status,
-				headers: response?.headers || {},
-			});
-			failures.push(
-				new Error(
-					`Redirect detected (${originalUrl}${targetInfo}) but redirects are disabled`,
-				),
+				options.checkOptions.statusCodes,
 			);
-		}
-		// Handle 'warn' mode - allow but warn on redirects
-		else if (options.checkOptions.redirects === 'warn') {
-			// Check if a redirect happened (either 3xx status or URL changed)
-			if (redirect.isRedirect || redirect.wasFollowed) {
-				// Emit warning about redirect
-				this.emit('redirect', {
+
+			if (customAction === 'ok') {
+				// Treat as success
+				state = LinkState.OK;
+			} else if (customAction === 'warn') {
+				// Treat as success but emit warning
+				state = LinkState.OK;
+				this.emit('statusCodeWarning', {
 					url: originalUrl,
-					targetUrl: redirect.targetUrl,
-					// Report actual redirect status if we have it, otherwise 200
-					status: redirect.isRedirect ? status : 200,
-					isNonStandard: redirect.isNonStandard,
+					status,
 				});
+			} else if (customAction === 'skip') {
+				// Skip this link entirely
+				state = LinkState.SKIPPED;
+			} else if (customAction === 'error') {
+				// Force failure
+				state = LinkState.BROKEN;
+				if (response !== undefined) {
+					failures.push(response);
+				}
 			}
-			// Still check final status for success/failure
-			if (status >= 200 && status < 300) {
+			// Special handling for bot protection responses
+			// Status 999: Used by LinkedIn and other sites to block automated requests
+			// Status 403 with cf-mitigated: Cloudflare bot protection challenge
+			// Since we cannot distinguish between valid and invalid URLs when blocked,
+			// treat these as skipped rather than broken.
+			else if (status === 999) {
+				state = LinkState.SKIPPED;
+			} else if (
+				status === 403 &&
+				response !== undefined &&
+				response.headers['cf-mitigated']
+			) {
+				state = LinkState.SKIPPED;
+			}
+			// Handle 'error' mode - treat any redirect as broken
+			else if (
+				options.checkOptions.redirects === 'error' &&
+				redirect.isRedirect
+			) {
+				state = LinkState.BROKEN;
+				const targetInfo = redirect.targetUrl
+					? ` to ${redirect.targetUrl}`
+					: '';
+				failures.push({
+					status,
+					headers: response?.headers || {},
+				});
+				failures.push(
+					new Error(
+						`Redirect detected (${originalUrl}${targetInfo}) but redirects are disabled`,
+					),
+				);
+			}
+			// Handle 'warn' mode - allow but warn on redirects
+			else if (options.checkOptions.redirects === 'warn') {
+				// Check if a redirect happened (either 3xx status or URL changed)
+				if (redirect.isRedirect || redirect.wasFollowed) {
+					// Emit warning about redirect
+					this.emit('redirect', {
+						url: originalUrl,
+						targetUrl: redirect.targetUrl,
+						// Report actual redirect status if we have it, otherwise 200
+						status: redirect.isRedirect ? status : 200,
+						isNonStandard: redirect.isNonStandard,
+					});
+				}
+				// Still check final status for success/failure
+				if (status >= 200 && status < 300) {
+					state = LinkState.OK;
+				} else if (
+					redirect.isRedirect &&
+					redirect.wasFollowed &&
+					response?.body
+				) {
+					// Non-standard redirect with content - treat as OK even in warn mode
+					state = LinkState.OK;
+				} else if (response !== undefined) {
+					failures.push(response);
+				}
+			}
+			// Handle 'allow' mode (default) - accept 2xx or non-standard redirects with content
+			else if (status >= 200 && status < 300) {
 				state = LinkState.OK;
 			} else if (
 				redirect.isRedirect &&
 				redirect.wasFollowed &&
 				response?.body
 			) {
-				// Non-standard redirect with content - treat as OK even in warn mode
+				// Non-standard redirect with content - treat as OK in allow mode
 				state = LinkState.OK;
 			} else if (response !== undefined) {
 				failures.push(response);
 			}
-		}
-		// Handle 'allow' mode (default) - accept 2xx or non-standard redirects with content
-		else if (status >= 200 && status < 300) {
-			state = LinkState.OK;
-		} else if (redirect.isRedirect && redirect.wasFollowed && response?.body) {
-			// Non-standard redirect with content - treat as OK in allow mode
-			state = LinkState.OK;
-		} else if (response !== undefined) {
-			failures.push(response);
-		}
 
-		// Handle HTTPS enforcement
-		// Skip enforcement for our own local static server since it can't use HTTPS
-		const isHttpUrl = originalUrl.startsWith('http://');
-		const isLocalStaticServer =
-			options.checkOptions.staticHttpServerHost &&
-			originalUrl.startsWith(options.checkOptions.staticHttpServerHost);
-
-		if (
-			isHttpUrl &&
-			!isLocalStaticServer &&
-			options.checkOptions.requireHttps === 'error'
-		) {
-			// Treat HTTP as broken in error mode
-			state = LinkState.BROKEN;
-			failures.push(
-				new Error(`HTTP link detected (${originalUrl}) but HTTPS is required`),
-			);
-		} else if (
-			isHttpUrl &&
-			!isLocalStaticServer &&
-			options.checkOptions.requireHttps === 'warn'
-		) {
-			// Emit warning about HTTP link in warn mode
-			this.emit('httpInsecure', {
-				url: originalUrl,
-			});
-		}
-
-		const result = withDisplayText(
-			{
-				url: mapUrl(options.url.href, options.checkOptions),
+			// Snapshot the fetch outcome for the shared ledger before applying
+			// per-entry policies. HTTPS enforcement depends on each requested URL,
+			// so every entry applies it to its own result row.
+			ledgerOutcome = {
+				finalUrl: response?.url || options.url.href,
 				status,
 				state,
-				parent: mapUrl(options.parent, options.checkOptions),
-				failureDetails: failures,
-			},
-			options.displayText,
-		);
-		options.results.push(result);
-		this.emit('link', result);
-		options.fragmentCandidates.set(options.url.href, {
-			isHtml: response !== undefined && isHtml(response),
-			state,
-		});
+				failureDetails: [...failures],
+				isHtml: response !== undefined && isHtml(response),
+				finalStatusIsRedirect: redirect.isRedirect,
+				finalRedirectNonStandard: redirect.isNonStandard,
+			};
 
-		// Check for fragment identifiers if needed (before we start crawling deeper)
-		// Only validate fragments if the base URL returned a successful (2xx) response
-		if (
-			options.checkOptions.checkFragments &&
-			response?.body &&
-			isHtml(response) &&
-			state === LinkState.OK
-		) {
-			// Convert and buffer the response body
-			const nodeStream = toNodeReadable(response.body);
-			const htmlContent = await bufferStream(nodeStream);
+			// Handle HTTPS enforcement
+			// Skip enforcement for our own local static server since it can't use HTTPS
+			const isHttpUrl = originalUrl.startsWith('http://');
+			const isLocalStaticServer =
+				options.checkOptions.staticHttpServerHost &&
+				originalUrl.startsWith(options.checkOptions.staticHttpServerHost);
 
-			// Check if this is likely a soft 404 by looking for noindex/nofollow meta tags
-			// Many soft 404 pages (pages that return 200 but show "Page Not Found") include these tags
-			const htmlString = htmlContent.toString('utf-8');
-			const isSoft404 =
-				htmlString.includes('content="noindex') &&
-				htmlString.includes('nofollow');
+			if (
+				isHttpUrl &&
+				!isLocalStaticServer &&
+				options.checkOptions.requireHttps === 'error'
+			) {
+				// Treat HTTP as broken in error mode
+				state = LinkState.BROKEN;
+				failures.push(
+					new Error(
+						`HTTP link detected (${originalUrl}) but HTTPS is required`,
+					),
+				);
+			} else if (
+				isHttpUrl &&
+				!isLocalStaticServer &&
+				options.checkOptions.requireHttps === 'warn'
+			) {
+				// Emit warning about HTTP link in warn mode
+				this.emit('httpInsecure', {
+					url: originalUrl,
+				});
+			}
 
-			await this.cacheFragmentPage(
-				options,
-				options.url.href,
-				htmlContent,
-				response.status,
-				!isSoft404,
+			const result = withDisplayText(
+				{
+					url: mapUrl(options.url.href, options.checkOptions),
+					status,
+					state,
+					parent: mapUrl(options.parent, options.checkOptions),
+					failureDetails: failures,
+				},
+				options.displayText,
 			);
+			if (response?.url && response.url !== options.url.href) {
+				result.finalUrl = mapUrl(response.url, options.checkOptions);
+			}
+			result.source = mapUrl(options.entryPoint, options.checkOptions);
+			options.results.push(result);
+			this.emit('link', result);
+			options.fragmentCandidates.set(options.url.href, {
+				isHtml: response !== undefined && isHtml(response),
+				state,
+			});
 
-			// Create a new stream from the buffered content for link extraction
-			response.body = Readable.from([htmlContent]) as never;
-		}
-
-		// If we need to go deeper, scan the next level of depth for links and crawl
-		if (options.crawl && shouldRecurse) {
-			this.emit('pagestart', options.url);
-			let urlResults: Awaited<ReturnType<typeof getLinks>> = [];
-			if (response?.body) {
-				// Convert to Node.js Readable stream (handles both Web and Node.js streams)
+			// Check for fragment identifiers if needed (before we start crawling deeper)
+			// Only validate fragments if the base URL returned a successful (2xx) response
+			if (
+				options.checkOptions.checkFragments &&
+				response?.body &&
+				isHtml(response) &&
+				state === LinkState.OK
+			) {
+				// Convert and buffer the response body
 				const nodeStream = toNodeReadable(response.body);
+				const htmlContent = await bufferStream(nodeStream);
 
-				// Use the final URL after redirects (if available) as the base for resolving
-				// relative links. This ensures relative links are resolved correctly even when
-				// the original URL doesn't have a trailing slash but redirects to one.
-				// Resolve links against the final response URL exactly as a browser does.
-				// In particular, an extensionless URL without a trailing slash is still
-				// a document URL; inventing a slash changes the meaning of relative links.
-				const baseUrl = response.url || options.url.href;
+				// Check if this is likely a soft 404 by looking for noindex/nofollow meta tags
+				// Many soft 404 pages (pages that return 200 but show "Page Not Found") include these tags
+				const htmlString = htmlContent.toString('utf-8');
+				const isSoft404 =
+					htmlString.includes('content="noindex') &&
+					htmlString.includes('nofollow');
 
-				// Parse HTML or CSS depending on content type
-				if (isHtml(response)) {
-					// Fragment checking buffered the response earlier, so recreate a stream
-					// before extracting links.
-					if (options.checkOptions.checkFragments) {
-						const htmlContent = await bufferStream(nodeStream);
-						const linkStream = Readable.from([htmlContent]);
-						urlResults = await getLinks(
-							linkStream,
-							baseUrl,
-							options.checkOptions.checkCss,
-						);
-					} else {
-						urlResults = await getLinks(
-							nodeStream,
-							baseUrl,
-							options.checkOptions.checkCss,
-						);
-					}
-				} else if (isCss(response) && options.checkOptions.checkCss) {
-					urlResults = await getCssLinks(nodeStream, baseUrl);
-				}
+				await this.cacheFragmentPage(
+					options,
+					options.url.href,
+					htmlContent,
+					response.status,
+					!isSoft404,
+				);
+				// Share the parsed fragment ids through the ledger so entries that
+				// reach this page through another URL can validate against them.
+				ledgerOutcome.fragmentPage = options.fragmentPages.get(
+					options.url.href,
+				);
+
+				// Create a new stream from the buffered content for link extraction
+				response.body = Readable.from([htmlContent]) as never;
 			}
-			const skippedUrlResults = new Set<(typeof urlResults)[number]>();
-			const skippedFragmentResults = new Set<(typeof urlResults)[number]>();
-			const preferredDisplayTextByUrl = new Map<string, string>();
-			const fallbackDisplayTextByUrl = new Map<string, string>();
-			const preferredDisplayTextByFragment = new Map<string, string>();
-			const urlsWithUnskippedOccurrences = new Set<string>();
-			for (const result of urlResults) {
-				if (!result.url) {
-					continue;
-				}
-				if (
-					this.hasSkipRules(options.checkOptions) &&
-					(result.url.protocol === 'http:' ||
-						result.url.protocol === 'https:') &&
-					result.urlWithFragment &&
-					(await this.shouldSkipUrl(
-						result.urlWithFragment,
-						options.checkOptions,
-					))
-				) {
-					skippedUrlResults.add(result);
-					continue;
-				}
-				if (result.displayText !== undefined) {
-					const fallback = fallbackDisplayTextByUrl.get(result.url.href);
-					if (
-						fallback === undefined ||
-						(fallback === '' && result.displayText !== '')
-					) {
-						fallbackDisplayTextByUrl.set(result.url.href, result.displayText);
+
+			// If we need to go deeper, scan the next level of depth for links and crawl
+			if (options.crawl && shouldRecurse) {
+				this.emit('pagestart', options.url);
+				let urlResults: Awaited<ReturnType<typeof getLinks>> = [];
+				if (response?.body) {
+					// Convert to Node.js Readable stream (handles both Web and Node.js streams)
+					const nodeStream = toNodeReadable(response.body);
+
+					// Use the final URL after redirects (if available) as the base for resolving
+					// relative links. This ensures relative links are resolved correctly even when
+					// the original URL doesn't have a trailing slash but redirects to one.
+					// Resolve links against the final response URL exactly as a browser does.
+					// In particular, an extensionless URL without a trailing slash is still
+					// a document URL; inventing a slash changes the meaning of relative links.
+					const baseUrl = response.url || options.url.href;
+
+					// Parse HTML or CSS depending on content type
+					if (isHtml(response)) {
+						// Fragment checking buffered the response earlier, so recreate a stream
+						// before extracting links.
+						if (options.checkOptions.checkFragments) {
+							const htmlContent = await bufferStream(nodeStream);
+							const linkStream = Readable.from([htmlContent]);
+							urlResults = await getLinks(
+								linkStream,
+								baseUrl,
+								options.checkOptions.checkCss,
+							);
+						} else {
+							urlResults = await getLinks(
+								nodeStream,
+								baseUrl,
+								options.checkOptions.checkCss,
+							);
+						}
+					} else if (isCss(response) && options.checkOptions.checkCss) {
+						urlResults = await getCssLinks(nodeStream, baseUrl);
 					}
 				}
-				if (
-					options.checkOptions.checkFragments &&
-					result.fragment &&
-					result.urlWithFragment &&
-					(await this.shouldSkipFragment(
-						result.fragment,
-						result.urlWithFragment,
-						options.checkOptions,
-					))
-				) {
-					skippedFragmentResults.add(result);
-					continue;
-				}
-				urlsWithUnskippedOccurrences.add(result.url.href);
-				if (result.displayText === undefined) {
-					continue;
-				}
-				const current = preferredDisplayTextByUrl.get(result.url.href);
-				if (
-					current === undefined ||
-					(current === '' && result.displayText !== '')
-				) {
-					preferredDisplayTextByUrl.set(result.url.href, result.displayText);
-				}
-				if (result.urlWithFragment && result.fragment) {
-					const fragmentUrl = this.rewriteUrl(
-						result.url.href,
-						options.checkOptions,
-					);
-					const fragmentKey = `${fragmentUrl}#${result.fragment}`;
-					const fragmentText = preferredDisplayTextByFragment.get(fragmentKey);
+				const skippedUrlResults = new Set<(typeof urlResults)[number]>();
+				const skippedFragmentResults = new Set<(typeof urlResults)[number]>();
+				const preferredDisplayTextByUrl = new Map<string, string>();
+				const fallbackDisplayTextByUrl = new Map<string, string>();
+				const preferredDisplayTextByFragment = new Map<string, string>();
+				const urlsWithUnskippedOccurrences = new Set<string>();
+				for (const result of urlResults) {
+					if (!result.url) {
+						continue;
+					}
 					if (
-						fragmentText === undefined ||
-						(fragmentText === '' && result.displayText !== '')
+						this.hasSkipRules(options.checkOptions) &&
+						(result.url.protocol === 'http:' ||
+							result.url.protocol === 'https:') &&
+						result.urlWithFragment &&
+						(await this.shouldSkipUrl(
+							result.urlWithFragment,
+							options.checkOptions,
+						))
 					) {
-						preferredDisplayTextByFragment.set(fragmentKey, result.displayText);
+						skippedUrlResults.add(result);
+						continue;
+					}
+					if (result.displayText !== undefined) {
+						const fallback = fallbackDisplayTextByUrl.get(result.url.href);
+						if (
+							fallback === undefined ||
+							(fallback === '' && result.displayText !== '')
+						) {
+							fallbackDisplayTextByUrl.set(result.url.href, result.displayText);
+						}
+					}
+					if (
+						options.checkOptions.checkFragments &&
+						result.fragment &&
+						result.urlWithFragment &&
+						(await this.shouldSkipFragment(
+							result.fragment,
+							result.urlWithFragment,
+							options.checkOptions,
+						))
+					) {
+						skippedFragmentResults.add(result);
+						continue;
+					}
+					urlsWithUnskippedOccurrences.add(result.url.href);
+					if (result.displayText === undefined) {
+						continue;
+					}
+					const current = preferredDisplayTextByUrl.get(result.url.href);
+					if (
+						current === undefined ||
+						(current === '' && result.displayText !== '')
+					) {
+						preferredDisplayTextByUrl.set(result.url.href, result.displayText);
+					}
+					if (result.urlWithFragment && result.fragment) {
+						const fragmentUrl = this.rewriteUrl(
+							result.url.href,
+							options.checkOptions,
+						);
+						const fragmentKey = `${fragmentUrl}#${result.fragment}`;
+						const fragmentText =
+							preferredDisplayTextByFragment.get(fragmentKey);
+						if (
+							fragmentText === undefined ||
+							(fragmentText === '' && result.displayText !== '')
+						) {
+							preferredDisplayTextByFragment.set(
+								fragmentKey,
+								result.displayText,
+							);
+						}
 					}
 				}
-			}
-			for (const result of urlResults) {
-				// If there was some sort of problem parsing the link while
-				// creating a new URL obj, treat it as a broken link.
-				if (!result.url) {
-					const r = withDisplayText(
-						{
-							url: mapUrl(result.link, options.checkOptions),
-							status: 0,
-							state: LinkState.BROKEN,
-							parent: mapUrl(options.url.href, options.checkOptions),
-						},
-						result.displayText,
-					);
-					options.results.push(r);
-					this.emit('link', r);
-					continue;
-				}
-				const preferredDisplayText =
-					preferredDisplayTextByUrl.get(result.url.href) ??
-					(urlsWithUnskippedOccurrences.has(result.url.href)
-						? undefined
-						: fallbackDisplayTextByUrl.get(result.url.href));
+				for (const result of urlResults) {
+					// If there was some sort of problem parsing the link while
+					// creating a new URL obj, treat it as a broken link.
+					if (!result.url) {
+						const r = withDisplayText(
+							{
+								url: mapUrl(result.link, options.checkOptions),
+								status: 0,
+								state: LinkState.BROKEN,
+								parent: mapUrl(options.url.href, options.checkOptions),
+								source: mapUrl(options.entryPoint, options.checkOptions),
+							},
+							result.displayText,
+						);
+						options.results.push(r);
+						this.emit('link', r);
+						continue;
+					}
+					const preferredDisplayText =
+						preferredDisplayTextByUrl.get(result.url.href) ??
+						(urlsWithUnskippedOccurrences.has(result.url.href)
+							? undefined
+							: fallbackDisplayTextByUrl.get(result.url.href));
 
-				// Requests are deduplicated by the fragmentless URL, but skip rules
-				// should see the complete URL as it appeared in the document.
-				if (skippedUrlResults.has(result)) {
-					const skippedResult = withDisplayText(
-						{
-							url: mapUrl(
-								result.urlWithFragment as string,
-								options.checkOptions,
-							),
-							state: LinkState.SKIPPED,
-							parent: mapUrl(options.url.href, options.checkOptions),
-						},
-						result.displayText,
-					);
-					options.results.push(skippedResult);
-					this.emit('link', skippedResult);
-					continue;
-				}
-
-				// Track fragments that need validation if checkFragments is enabled
-				if (
-					options.checkOptions.checkFragments &&
-					result.fragment &&
-					result.fragment.length > 0
-				) {
-					if (skippedFragmentResults.has(result)) {
-						const skippedFragmentResult = withDisplayText(
+					// Requests are deduplicated by the fragmentless URL, but skip rules
+					// should see the complete URL as it appeared in the document.
+					if (skippedUrlResults.has(result)) {
+						const skippedResult = withDisplayText(
 							{
 								url: mapUrl(
 									result.urlWithFragment as string,
@@ -1214,133 +1411,181 @@ export class LinkChecker extends EventEmitter {
 								),
 								state: LinkState.SKIPPED,
 								parent: mapUrl(options.url.href, options.checkOptions),
+								source: mapUrl(options.entryPoint, options.checkOptions),
 							},
 							result.displayText,
 						);
-						options.results.push(skippedFragmentResult);
-						this.emit('link', skippedFragmentResult);
-					} else {
-						const fragmentUrl = this.rewriteUrl(
-							result.url.href,
-							options.checkOptions,
-						);
-						this.registerFragmentReference(
-							options,
-							fragmentUrl,
-							result.fragment,
-							preferredDisplayTextByFragment.get(
-								`${fragmentUrl}#${result.fragment}`,
-							),
-						);
+						options.results.push(skippedResult);
+						this.emit('link', skippedResult);
+						continue;
 					}
-				}
 
-				let crawl =
-					options.checkOptions.recurse &&
-					result.url?.href.startsWith(options.rootPath);
-
-				// Only crawl links that start with the same host
-				if (crawl) {
-					try {
-						const pathUrl = new URL(options.rootPath);
-						crawl = result.url.host === pathUrl.host;
-					} catch {
-						// ignore errors
-					}
-				}
-
-				// Create a unique key for this URL-parent relationship
-				// Use the current page (options.url.href) as the parent in the relationship
-				const relationshipKey = `${result.url.href}|${options.url.href}`;
-
-				// Check if we've already reported this specific relationship
-				if (options.relationshipCache.has(relationshipKey)) {
-					continue;
-				}
-
-				// Mark this relationship as seen
-				options.relationshipCache.add(relationshipKey);
-
-				// Check if URL has been HTTP-checked before
-				const inCache = options.cache.has(result.url.href);
-
-				if (!inCache) {
-					// URL hasn't been checked, add to cache and create a promise for the check
-					options.cache.add(result.url.href);
-
-					if (result.url === undefined) {
-						throw new Error('url is undefined');
-					}
-					this.enqueueCrawl({
-						url: result.url,
-						displayText: preferredDisplayText,
-						crawl: crawl ?? false,
-						cache: options.cache,
-						relationshipCache: options.relationshipCache,
-						fragmentReferences: options.fragmentReferences,
-						fragmentRelationshipCache: options.fragmentRelationshipCache,
-						fragmentPages: options.fragmentPages,
-						fragmentCandidates: options.fragmentCandidates,
-						pendingChecks: options.pendingChecks,
-						delayCache: options.delayCache,
-						retryErrorsCache: options.retryErrorsCache,
-						results: options.results,
-						checkOptions: options.checkOptions,
-						queue: options.queue,
-						parent: options.url.href,
-						rootPath: options.rootPath,
-						retry: options.retry,
-						retryErrors: options.retryErrors,
-						retryErrorsCount: options.retryErrorsCount,
-						retryErrorsJitter: options.retryErrorsJitter,
-						requestLimiter: options.requestLimiter,
-						signal: options.signal,
-					});
-				} else {
-					// URL is being checked or has been checked
-					// Only report duplicate results for BROKEN links so users can see
-					// all parents that reference broken URLs. For OK/SKIPPED links,
-					// we don't need to report them multiple times as this causes
-					// massive result inflation for heavily interlinked sites.
-					const urlHref = result.url.href;
-					const parentHref = options.url.href;
-					const pendingCheck = options.pendingChecks.get(urlHref);
-
-					// Queue the reuse operation to check if the link is broken
-					options.queue.add(async () => {
-						// If there's a pending check, wait for it
-						if (pendingCheck) {
-							await pendingCheck;
-						}
-
-						// Now the result should be in the results array
-						const cachedResult = options.results.find(
-							(r) => r.url === mapUrl(urlHref, options.checkOptions),
-						);
-						// Only emit duplicate results for BROKEN links
-						if (cachedResult && cachedResult.state === LinkState.BROKEN) {
-							const reusedResult = withDisplayText(
+					// Track fragments that need validation if checkFragments is enabled
+					if (
+						options.checkOptions.checkFragments &&
+						result.fragment &&
+						result.fragment.length > 0
+					) {
+						if (skippedFragmentResults.has(result)) {
+							const skippedFragmentResult = withDisplayText(
 								{
-									url: cachedResult.url,
-									status: cachedResult.status,
-									state: cachedResult.state,
-									parent: mapUrl(parentHref, options.checkOptions),
-									failureDetails: cachedResult.failureDetails,
+									url: mapUrl(
+										result.urlWithFragment as string,
+										options.checkOptions,
+									),
+									state: LinkState.SKIPPED,
+									parent: mapUrl(options.url.href, options.checkOptions),
+									source: mapUrl(options.entryPoint, options.checkOptions),
 								},
-								preferredDisplayText,
+								result.displayText,
 							);
-							options.results.push(reusedResult);
-							this.emit('link', reusedResult);
+							options.results.push(skippedFragmentResult);
+							this.emit('link', skippedFragmentResult);
+						} else {
+							const fragmentUrl = this.rewriteUrl(
+								result.url.href,
+								options.checkOptions,
+							);
+							this.registerFragmentReference(
+								options,
+								fragmentUrl,
+								result.fragment,
+								preferredDisplayTextByFragment.get(
+									`${fragmentUrl}#${result.fragment}`,
+								),
+							);
 						}
-					});
+					}
+
+					let crawl =
+						options.checkOptions.recurse &&
+						result.url?.href.startsWith(options.rootPath);
+
+					// Only crawl links that start with the same host
+					if (crawl) {
+						try {
+							const pathUrl = new URL(options.rootPath);
+							crawl = result.url.host === pathUrl.host;
+						} catch {
+							// ignore errors
+						}
+					}
+
+					// Create a unique key for this URL-parent relationship
+					// Use the current page (options.url.href) as the parent in the relationship
+					const relationshipKey = `${result.url.href}|${options.url.href}`;
+
+					// Check if we've already reported this specific relationship
+					if (options.relationshipCache.has(relationshipKey)) {
+						continue;
+					}
+
+					// Mark this relationship as seen
+					options.relationshipCache.add(relationshipKey);
+
+					// Check if URL has been HTTP-checked before
+					const inCache = options.cache.has(result.url.href);
+
+					if (!inCache) {
+						// URL hasn't been checked, add to cache and create a promise for the check
+						options.cache.add(result.url.href);
+
+						if (result.url === undefined) {
+							throw new Error('url is undefined');
+						}
+						this.enqueueCrawl({
+							url: result.url,
+							displayText: preferredDisplayText,
+							crawl: crawl ?? false,
+							cache: options.cache,
+							relationshipCache: options.relationshipCache,
+							fragmentReferences: options.fragmentReferences,
+							fragmentRelationshipCache: options.fragmentRelationshipCache,
+							fragmentPages: options.fragmentPages,
+							fragmentCandidates: options.fragmentCandidates,
+							pendingChecks: options.pendingChecks,
+							delayCache: options.delayCache,
+							retryErrorsCache: options.retryErrorsCache,
+							results: options.results,
+							checkOptions: options.checkOptions,
+							queue: options.queue,
+							parent: options.url.href,
+							rootPath: options.rootPath,
+							retry: options.retry,
+							retryErrors: options.retryErrors,
+							retryErrorsCount: options.retryErrorsCount,
+							retryErrorsJitter: options.retryErrorsJitter,
+							requestLimiter: options.requestLimiter,
+							signal: options.signal,
+							crawlId: Symbol(),
+							entryPoint: options.entryPoint,
+							fetchLedger: options.fetchLedger,
+							waitGraph: options.waitGraph,
+						});
+					} else {
+						// URL is being checked or has been checked
+						// Only report duplicate results for BROKEN links so users can see
+						// all parents that reference broken URLs. For OK/SKIPPED links,
+						// we don't need to report them multiple times as this causes
+						// massive result inflation for heavily interlinked sites.
+						const urlHref = result.url.href;
+						const parentHref = options.url.href;
+						const pendingCheck = options.pendingChecks.get(urlHref);
+
+						// Queue the reuse operation to check if the link is broken
+						options.queue.add(async () => {
+							// If there's a pending check, wait for it
+							if (pendingCheck) {
+								await pendingCheck;
+							}
+
+							// Now the result should be in the results array
+							const cachedResult = options.results.find(
+								(r) => r.url === mapUrl(urlHref, options.checkOptions),
+							);
+							// Only emit duplicate results for BROKEN links
+							if (cachedResult && cachedResult.state === LinkState.BROKEN) {
+								const reusedResult = withDisplayText(
+									{
+										url: cachedResult.url,
+										status: cachedResult.status,
+										state: cachedResult.state,
+										parent: mapUrl(parentHref, options.checkOptions),
+										failureDetails: cachedResult.failureDetails,
+										source: mapUrl(options.entryPoint, options.checkOptions),
+									},
+									preferredDisplayText,
+								);
+								options.results.push(reusedResult);
+								this.emit('link', reusedResult);
+							}
+						});
+					}
 				}
 			}
-		}
 
-		// Drain any unconsumed response body to release the connection back to the pool.
-		// This is critical for preventing port exhaustion - if the body isn't consumed,
-		// the underlying TCP connection may not be reused.
-		await drainStream(response?.body);
+			// Drain any unconsumed response body to release the connection back to the pool.
+			// This is critical for preventing port exhaustion - if the body isn't consumed,
+			// the underlying TCP connection may not be reused.
+			await drainStream(response?.body);
+		} finally {
+			// Settle this crawl's ledger entry so entries waiting on it can
+			// reuse the outcome. Retries keep the entry pending until the final
+			// attempt completes.
+			if (!ledgerKeepPending) {
+				ledgerEntry.resolve(
+					ledgerOutcome ?? {
+						finalUrl: options.url.href,
+						status: 0,
+						state: LinkState.BROKEN,
+						failureDetails: [],
+						isHtml: false,
+						finalStatusIsRedirect: false,
+						finalRedirectNonStandard: false,
+					},
+				);
+			}
+		}
 	}
 
 	private async checkRemainingFragments(
@@ -1441,6 +1686,18 @@ export class LinkChecker extends EventEmitter {
 					return;
 				}
 
+				// If the redirect target was already parsed for fragments under
+				// its own URL, adopt that page instead of parsing it again.
+				const responseUrl = response.url;
+				if (responseUrl && responseUrl !== url) {
+					const existingPage = context.fragmentPages.get(responseUrl);
+					if (existingPage) {
+						await drainStream(response.body);
+						this.adoptFragmentPage(context, url, existingPage);
+						return;
+					}
+				}
+
 				const htmlContent = await bufferStream(toNodeReadable(response.body));
 				const htmlString = htmlContent.toString('utf-8');
 				const isSoft404 =
@@ -1482,17 +1739,36 @@ export class LinkChecker extends EventEmitter {
 		const validFragments = shouldValidate
 			? await extractFragmentIds(Readable.from([htmlContent]))
 			: undefined;
-		context.fragmentPages.set(url, { status, validFragments });
+		this.adoptFragmentPage(context, url, { status, validFragments });
+	}
+
+	/**
+	 * Record the fragment ids known for a page and validate any pending
+	 * references against them. Shared by crawls that parsed the page and by
+	 * crawls that adopted the page through the fetch ledger.
+	 */
+	private adoptFragmentPage(
+		context: FragmentContext,
+		url: string,
+		page: FragmentPage,
+	): void {
+		context.fragmentPages.set(url, page);
 		const fragmentsToValidate = context.fragmentReferences.get(url);
 		context.fragmentReferences.delete(url);
-		if (!validFragments || !fragmentsToValidate) {
+		if (!page.validFragments || !fragmentsToValidate) {
 			return;
 		}
 
 		for (const [fragment, references] of fragmentsToValidate) {
-			if (!isValidFragment(fragment, validFragments)) {
+			if (!isValidFragment(fragment, page.validFragments)) {
 				for (const reference of references.values()) {
-					this.recordBrokenFragment(context, url, fragment, status, reference);
+					this.recordBrokenFragment(
+						context,
+						url,
+						fragment,
+						page.status,
+						reference,
+					);
 				}
 			}
 		}
@@ -1511,6 +1787,7 @@ export class LinkChecker extends EventEmitter {
 				status,
 				state: LinkState.BROKEN,
 				parent: mapUrl(reference.parent, context.checkOptions),
+				source: mapUrl(reference.source, context.checkOptions),
 				failureDetails: [
 					new Error(`Fragment identifier '#${fragment}' not found on page`),
 				],
@@ -1534,7 +1811,7 @@ export class LinkChecker extends EventEmitter {
 		}
 		options.fragmentRelationshipCache.add(relationshipKey);
 
-		const reference = { displayText, parent };
+		const reference = { displayText, parent, source: options.entryPoint };
 		const fragmentPage = options.fragmentPages.get(url);
 		if (fragmentPage) {
 			if (
@@ -1595,6 +1872,213 @@ export class LinkChecker extends EventEmitter {
 		};
 	}
 
+	/**
+	 * Process a redirect target for an in-flight crawl: apply rewrite and skip
+	 * rules, then consult the shared fetch ledger. Targets another crawl
+	 * already owns stop the chain so the final page is fetched only once;
+	 * targets owned by this crawl are followed so redirect loops still
+	 * terminate at the fetch redirect limit.
+	 */
+	private async processCrawlRedirectTarget(
+		href: string,
+		options: CrawlOptions,
+	): Promise<RedirectTarget> {
+		const url = this.rewriteUrl(href, options.checkOptions);
+		if (
+			(this.hasSkipRules(options.checkOptions) ||
+				Boolean(options.checkOptions.urlRewriteExpressions?.length)) &&
+			(await this.shouldSkipUrl(url, options.checkOptions))
+		) {
+			return { url, shouldSkip: true };
+		}
+
+		const key = normalizeUrlKey(url);
+		const existing = options.fetchLedger.get(key);
+		if (existing) {
+			return {
+				url,
+				shouldSkip: false,
+				stop: existing.owner !== options.crawlId,
+			};
+		}
+		if (options.ledgerEntry) {
+			options.fetchLedger.set(key, options.ledgerEntry);
+		}
+		return { url, shouldSkip: false };
+	}
+
+	/**
+	 * Follow up on a response whose redirect chain stopped at a ledger-owned
+	 * page. Reuses the shared outcome when possible; otherwise fetches the
+	 * target directly. Falls back to ledger-free redirect handling after too
+	 * many hops so pathological chains still terminate.
+	 */
+	private async followLedgerHits(
+		method: string,
+		response: RequestResponse,
+		options: CrawlOptions,
+		requestOptions: Parameters<typeof makeRequest>[2],
+		fallbackRequestOptions: Parameters<typeof makeRequest>[2],
+	): Promise<
+		| { response: RequestResponse; reused?: undefined }
+		| { response?: undefined; reused: FetchOutcome }
+	> {
+		let current = response;
+		for (let hops = 0; current.ledgerHit; hops++) {
+			const hitUrl = current.ledgerHit;
+			const entry = options.fetchLedger.get(normalizeUrlKey(hitUrl));
+			const reused = entry
+				? await this.reuseLedgerEntry(entry, options)
+				: undefined;
+			if (reused) {
+				return { reused };
+			}
+			current = await makeRequest(
+				method,
+				hitUrl,
+				hops >= 20 ? fallbackRequestOptions : requestOptions,
+			);
+		}
+		return { response: current };
+	}
+
+	/**
+	 * Wait for another crawl's ledger entry and, when the outcome satisfies
+	 * this crawl's needs, record a result row for this crawl's own URL from
+	 * it. Returns the shared outcome, or undefined when this crawl must fetch
+	 * for itself (cycle, abort, or a HEAD-only entry when a GET crawl is
+	 * required).
+	 */
+	private async reuseLedgerEntry(
+		entry: FetchLedgerEntry,
+		options: CrawlOptions,
+	): Promise<FetchOutcome | undefined> {
+		if (entry.owner === options.crawlId) {
+			return undefined;
+		}
+
+		// Refuse to wait on a crawl that is (transitively) waiting on us;
+		// fetching directly breaks the cycle.
+		let cursor: symbol | undefined = entry.owner;
+		const seen = new Set<symbol>();
+		while (cursor) {
+			if (cursor === options.crawlId) {
+				return undefined;
+			}
+			if (!seen.add(cursor)) {
+				break;
+			}
+			cursor = options.waitGraph.get(cursor);
+		}
+
+		options.waitGraph.set(options.crawlId, entry.owner);
+		let outcome: FetchOutcome | undefined;
+		try {
+			outcome = await Promise.race([
+				entry.promise,
+				waitForAbort(options.signal),
+			]);
+		} finally {
+			options.waitGraph.delete(options.crawlId);
+		}
+		if (!outcome) {
+			return undefined;
+		}
+		// A crawl that needs to recurse cannot reuse a HEAD-only outcome.
+		if (options.crawl && !entry.crawl) {
+			return undefined;
+		}
+
+		this.recordLedgerResult(options, outcome);
+		return outcome;
+	}
+
+	/**
+	 * Record this crawl's result row from a shared ledger outcome, applying
+	 * the policies that are specific to each requested URL (redirect and
+	 * status-code warnings, HTTPS enforcement) so every entry point keeps its
+	 * own traceable result.
+	 */
+	private recordLedgerResult(
+		options: CrawlOptions,
+		outcome: FetchOutcome,
+	): void {
+		const originalUrl = options.url.href;
+		const failures = [...outcome.failureDetails];
+		let state = outcome.state;
+
+		const customAction = getStatusCodeAction(
+			outcome.status ?? 0,
+			options.checkOptions.statusCodes,
+		);
+		if (customAction === 'warn') {
+			this.emit('statusCodeWarning', {
+				url: originalUrl,
+				status: outcome.status ?? 0,
+			});
+		}
+
+		const landedElsewhere =
+			normalizeUrlKey(outcome.finalUrl) !== normalizeUrlKey(originalUrl);
+		if (options.checkOptions.redirects === 'warn' && landedElsewhere) {
+			this.emit('redirect', {
+				url: originalUrl,
+				targetUrl: outcome.finalUrl,
+				status: outcome.finalStatusIsRedirect ? (outcome.status ?? 0) : 200,
+				isNonStandard: outcome.finalRedirectNonStandard,
+			} satisfies RedirectInfo);
+		}
+
+		// Handle HTTPS enforcement for this entry's own URL
+		const isHttpUrl = originalUrl.startsWith('http://');
+		const isLocalStaticServer =
+			options.checkOptions.staticHttpServerHost &&
+			originalUrl.startsWith(options.checkOptions.staticHttpServerHost);
+		if (
+			isHttpUrl &&
+			!isLocalStaticServer &&
+			options.checkOptions.requireHttps === 'error'
+		) {
+			state = LinkState.BROKEN;
+			failures.push(
+				new Error(`HTTP link detected (${originalUrl}) but HTTPS is required`),
+			);
+		} else if (
+			isHttpUrl &&
+			!isLocalStaticServer &&
+			options.checkOptions.requireHttps === 'warn'
+		) {
+			this.emit('httpInsecure', {
+				url: originalUrl,
+			});
+		}
+
+		const result = withDisplayText(
+			{
+				url: mapUrl(originalUrl, options.checkOptions),
+				status: outcome.status,
+				state,
+				parent: mapUrl(options.parent, options.checkOptions),
+				failureDetails: failures,
+			},
+			options.displayText,
+		);
+		if (landedElsewhere) {
+			result.finalUrl = mapUrl(outcome.finalUrl, options.checkOptions);
+		}
+		result.source = mapUrl(options.entryPoint, options.checkOptions);
+		options.results.push(result);
+		this.emit('link', result);
+
+		options.fragmentCandidates.set(originalUrl, {
+			isHtml: outcome.isHtml,
+			state,
+		});
+		if (options.checkOptions.checkFragments && outcome.fragmentPage) {
+			this.adoptFragmentPage(options, originalUrl, outcome.fragmentPage);
+		}
+	}
+
 	private async shouldSkipUrl(
 		href: string,
 		checkOptions: InternalCheckOptions,
@@ -1641,6 +2125,7 @@ export class LinkChecker extends EventEmitter {
 						: 0,
 				state: LinkState.SKIPPED,
 				parent: mapUrl(options.parent, options.checkOptions),
+				source: mapUrl(options.entryPoint, options.checkOptions),
 			},
 			options.displayText,
 		);

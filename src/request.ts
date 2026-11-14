@@ -14,11 +14,20 @@ export type HttpResponse = {
 	url?: string;
 };
 
-export type RequestResponse = HttpResponse & { redirectSkipped?: string };
+export type RequestResponse = HttpResponse & {
+	redirectSkipped?: string;
+	ledgerHit?: string;
+};
 
 export type RedirectTarget = {
 	url: string;
 	shouldSkip: boolean;
+	/**
+	 * When true, the redirect chain stops before fetching this target because
+	 * another crawl already owns a fetch of it. The response reports the target
+	 * via `ledgerHit` so the caller can reuse the shared outcome instead.
+	 */
+	stop?: boolean;
 };
 
 type ProcessRedirectTarget = (url: string) => Promise<RedirectTarget>;
@@ -114,6 +123,10 @@ export async function makeRequest(
 		if (target.shouldSkip) {
 			await drainStream(result.body);
 			return { ...result, body: undefined, redirectSkipped: target.url };
+		}
+		if (target.stop) {
+			await drainStream(result.body);
+			return { ...result, body: undefined, ledgerHit: target.url };
 		}
 		if (redirectCount >= 20) {
 			await drainStream(result.body);

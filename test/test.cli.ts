@@ -552,6 +552,62 @@ describe('cli', () => {
 		assert.match(response.stderr, /Successfully scanned/);
 	});
 
+	it('should trace entries to their final page in JSON output', async () => {
+		const requestedPaths: string[] = [];
+		server = http.createServer((request, response) => {
+			requestedPaths.push(request.url || '');
+			if (request.url === '/old-a' || request.url === '/old-b') {
+				response.writeHead(301, { Location: '/final' });
+				response.end();
+				return;
+			}
+			if (request.url === '/final') {
+				response.writeHead(200, { 'Content-Type': 'text/html' });
+				response.end('<html><body>final</body></html>');
+				return;
+			}
+			response.writeHead(404);
+			response.end();
+		});
+		await new Promise<void>((resolve) => server.listen(0, resolve));
+		const address = server.address() as AddressInfo;
+		const oldA = `http://localhost:${address.port}/old-a`;
+		const oldB = `http://localhost:${address.port}/old-b`;
+		const finalUrl = `http://localhost:${address.port}/final`;
+
+		const response = await execa(node, [
+			linkinator,
+			oldA,
+			oldB,
+			'--format',
+			'json',
+			'--concurrency',
+			'1',
+		]);
+		const result = JSON.parse(response.stdout) as {
+			passed: boolean;
+			links: LinkResult[];
+		};
+		assert.ok(result.passed);
+		// The shared final page is fetched only once across entry points.
+		assert.deepStrictEqual(requestedPaths.sort(), [
+			'/final',
+			'/old-a',
+			'/old-b',
+		]);
+		assert.strictEqual(result.links.length, 2);
+		for (const [index, entry] of [oldA, oldB].entries()) {
+			const link = result.links[index];
+			// Existing JSON fields are preserved...
+			assert.strictEqual(link.url, entry);
+			assert.strictEqual(link.state, LinkState.OK);
+			assert.strictEqual(link.status, 200);
+			// ...and each entry traces back to its seed and final page.
+			assert.strictEqual(link.source, entry);
+			assert.strictEqual(link.finalUrl, finalUrl);
+		}
+	});
+
 	it('should respect URL rewrite expressions from config files across redirects', async () => {
 		const requestedPaths: string[] = [];
 		server = http.createServer((request, response) => {
